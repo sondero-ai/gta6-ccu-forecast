@@ -14,6 +14,9 @@ const MIN_SAMPLES = 5;
 const LANE_PEAK = 8; // keep launches peaking at or after hour 9 of the UTC day
 const MIN_V0 = 100;
 const HOUR_MS = 3_600_000;
+const KERNEL_BW = 1.0; // Gaussian kernel bandwidth in log-viewer space
+const WINSOR_LOW = 0.05;
+const WINSOR_HIGH = 0.95;
 
 interface HourlyPoint { from?: string; viewers?: number }
 interface Comparable { day_start?: string; hourly?: HourlyPoint[] }
@@ -34,6 +37,15 @@ const median = (xs: number[]): number => {
   const s = [...xs].sort((a, b) => a - b);
   const mid = s.length >> 1;
   return s.length % 2 === 1 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+};
+
+/** Linearly interpolated empirical quantile; xs must be non-empty. */
+const percentile = (xs: number[], p: number): number => {
+  const s = [...xs].sort((a, b) => a - b);
+  const pos = (s.length - 1) * p;
+  const lo = Math.floor(pos);
+  const hi = Math.ceil(pos);
+  return s[lo] + (s[hi] - s[lo]) * (pos - lo);
 };
 
 /** Population standard deviation. */
@@ -83,19 +95,28 @@ const peakOf = (shape: Shape): number | null => {
   return peak;
 };
 
-/** Ordinary least squares y = a + b*x; flat line if x has no spread. */
-const fitLine = (xs: number[], ys: number[]) => {
-  const n = xs.length;
-  const xBar = xs.reduce((a, b) => a + b, 0) / n;
-  const yBar = ys.reduce((a, b) => a + b, 0) / n;
+/** Weighted least squares y = a + b*x; flat line if weighted x has no spread. */
+const fitLine = (xs: number[], ys: number[], ws: number[]) => {
+  const wSum = ws.reduce((a, b) => a + b, 0);
+  const xBar = xs.reduce((sum, x, i) => sum + ws[i] * x, 0) / wSum;
+  const yBar = ys.reduce((sum, y, i) => sum + ws[i] * y, 0) / wSum;
   let sxx = 0;
   let sxy = 0;
-  for (let i = 0; i < n; i++) {
-    sxx += (xs[i] - xBar) ** 2;
-    sxy += (xs[i] - xBar) * (ys[i] - yBar);
+  for (let i = 0; i < xs.length; i++) {
+    const dx = xs[i] - xBar;
+    sxx += ws[i] * dx * dx;
+    sxy += ws[i] * dx * (ys[i] - yBar);
   }
   const b = sxx > 0 ? sxy / sxx : 0;
   return { a: yBar - b * xBar, b };
+};
+
+/** Weighted population standard deviation. */
+const weightedStd = (xs: number[], ws: number[]): number => {
+  const wSum = ws.reduce((a, b) => a + b, 0);
+  if (xs.length === 0 || !(wSum > 0)) return 0;
+  const mean = xs.reduce((sum, x, i) => sum + ws[i] * x, 0) / wSum;
+  return Math.sqrt(xs.reduce((sum, x, i) => sum + ws[i] * (x - mean) ** 2, 0) / wSum);
 };
 
 mkdirSync(OUTPUT_DIR, { recursive: true });
@@ -119,6 +140,15 @@ for (const file of files) {
     return peak !== null && peak >= LANE_PEAK;
   });
 
+  // Do not extrapolate beyond the lane's observed hour-1 scale when predicting.
+  const laneX = lane.map((s) => Math.log(s.v0));
+  let xTarget = Math.log(h1);
+  if (laneX.length > 0) {
+    const xLo = percentile(laneX, WINSOR_LOW);
+    const xHi = percentile(laneX, WINSOR_HIGH);
+    xTarget = Math.min(xHi, Math.max(xLo, xTarget));
+  }
+
   // Model per target hour h = 2..24, indexed k = h - 1 = 1..23.
   const mu: number[] = new Array(23).fill(0);
   const sigma: number[] = new Array(23).fill(NaN);
@@ -126,10 +156,15 @@ for (const file of files) {
     const samples = lane.flatMap((s) =>
       Number.isFinite(s.ratios[k]) ? [{ x: Math.log(s.v0), y: Math.log(s.ratios[k]) }] : []);
     if (samples.length >= MIN_SAMPLES) {
-      const { a, b } = fitLine(samples.map((s) => s.x), samples.map((s) => s.y));
-      const residuals = samples.map((s) => s.y - (a + b * s.x));
-      mu[k - 1] = a + b * Math.log(h1);
-      sigma[k - 1] = popStd(residuals);
+      const xs = samples.map((s) => s.x);
+      const ys = samples.map((s) => s.y);
+      // Kernel weights keep the fit local to the target's scale.
+      let weights = xs.map((x) => Math.exp(-0.5 * ((x - xTarget) / KERNEL_BW) ** 2));
+      if (!(weights.reduce((a, b) => a + b, 0) > 0)) weights = xs.map(() => 1);
+      const { a, b } = fitLine(xs, ys, weights);
+      const residuals = ys.map((y, i) => y - (a + b * xs[i]));
+      mu[k - 1] = a + b * xTarget; // winsorized prediction point
+      sigma[k - 1] = weightedStd(residuals, weights);
     } else {
       // Too few peers in the lane: use the median shape over the whole pool,
       // with its log spread around that median.
